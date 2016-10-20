@@ -3,20 +3,52 @@
 #include <string.h>
 #include <signal.h>
  
+#define BUFF_FULLSIZE 2049 // lets have \0 on the end of buffer
 #define BUFF_SIZE 2048
  
-int bash_read(char * buff)
+char * bash_read(char * buff, size_t * buffer_size)
 {
-    size_t sread = 0;
+ 
+    // let fill buff with \0, just to be in the save side
+    if (*buffer_size == 0)
+        memset(buff, 0, BUFF_FULLSIZE);
+ 
+    char * clcr = strchr(buff, '\n');
+found:
+    if (clcr && (size_t) (clcr - buff) < *buffer_size) // if we found '\n' in buff[0]..buff[buffer_size] bound
+    {
+       
+        // make a copy of command(c-string from buff[0] to clcr)
+        size_t command_size = clcr - buff;
+        char * command = new char[command_size + 1];
+        memcpy(command, buff, command_size);
+        command[command_size + 1] = '\0';
+       
+        //shift buff (eg: buff="aba\ncaba" => command="aba\n", buff="caba")
+        memmove(buff, clcr + 1, *buffer_size - command_size - 1);
+        *buffer_size -= command_size + 1;  
+ 
+        return command;
+    }
+   
+    ssize_t sread = 0;
     while (1)
     {
-        sread += read(0, buff + sread, BUFF_SIZE - sread);
-        if (!sread)
-            return 0;
-        char * clcr = strchr(buff, '\n');
+        sread = read(0, buff + *buffer_size, BUFF_SIZE - *buffer_size);
+        // if error or 0
+        if (sread == -1)
+            return NULL;
+        if (sread == 0)
+        {
+            *buffer_size = 0;
+            return NULL;
+        }
+       
+        *buffer_size += sread;
+        clcr = strchr(buff, '\n');
         if (!clcr)
             continue;
-        return sread;
+        goto found;
     }
 }
  
@@ -72,61 +104,81 @@ char * get_next_arg(char ** substr)
     return arg;
 }
  
-char *** bash_parse(char * buff, size_t * args_size, ssize_t * end)
+char *** bash_parse(char * command, size_t * args_size)
 {
-    if (*buff == '\0') {
+    if (*command == '\0') {
         *args_size = 0;
         return NULL;
     }
-    char * del  = strchr(buff, '\n');
-    char * line = new char[del - buff + 1];
-    memcpy(line, buff, del - buff);
-    line[del - buff] = '\0';
-    *end = del - buff + 1;
-    size_t commands = 0;
-    char * substr = line;
+   
+    size_t subcommands_counter = 0;
+    char * substr = command;
     while (substr)
     {
         substr = strchr(substr, '|');
         if (substr)
             substr++;
-        commands++;
+        subcommands_counter++;
     }
-    char *** args = new char ** [commands + 1];
-    args[commands] = NULL;
-    *args_size = commands;
+    char *** args = new char ** [subcommands_counter + 1];
+    args[subcommands_counter] = NULL;
+    *args_size = subcommands_counter;
  
-    substr = line;
-    size_t command_num = 0;
+    substr = command;
+    size_t subcommand_num = 0;
     while (substr)
     {
         size_t args_count = count_args(substr);
-        args[command_num] = new char * [args_count + 1];
-        args[command_num][args_count] = NULL;
+        args[subcommand_num] = new char * [args_count + 1];
+        args[subcommand_num][args_count] = NULL;
         char * delim = strchr(substr, '|');
         for (size_t arg_num = 0; arg_num < args_count; ++arg_num) {
-            args[command_num][arg_num] = get_next_arg(&substr);
+            args[subcommand_num][arg_num] = get_next_arg(&substr);
         }
         for (size_t i = 0; i <= args_count; ++i)
         if (delim)
             substr = delim + 1; // skip '|'
         else
             substr = delim;
-        command_num++;
+        subcommand_num++;
     }
  
     return args;
 }
  
-pid_t * childs = NULL;
+volatile pid_t * childs = NULL;
+volatile bool sig_int = false;
+volatile bool first_alive = false;
  
-void killChildren(int ignored) {
-    if (childs)
-        for (pid_t * child = childs; *child != 0; ++child)
-            kill(*child ,SIGKILL);
+void signal_handler(int signal, siginfo_t * siginfo, void * ptr) {
+    if (signal == SIGINT) sig_int = true;
+    if (signal == SIGCHLD && childs && siginfo->si_pid == childs[0])
+    {
+        first_alive = false;
+    }
 }
  
-int bash_execute(char * buff, size_t size, ssize_t end, char *** args, size_t args_size)
+void write_all(int fd, const char *buf, size_t len) {
+    while (len > 0)
+    {
+        ssize_t writen = write(fd, buf, len);
+        if (writen == -1) {
+            continue;
+        }
+        buf += writen;
+        len -= writen;
+    }  
+}
+ 
+void sig_intr() {
+    if (sig_int) {
+        for (volatile pid_t * child = childs; *child != 0; ++child)
+            kill(*child ,SIGKILL);
+    }
+    sig_int = false;
+}
+ 
+int bash_execute(char * buffer, size_t * buffer_size, char *** args, size_t args_size)
 {
     if (!args_size)
         return 0;
@@ -135,8 +187,7 @@ int bash_execute(char * buff, size_t size, ssize_t end, char *** args, size_t ar
     childs[args_size] = 0;
  
     pid_t pid;    
-    if (size != (size_t)end)
-        pipe(pipefd[0]); // pipe from parent to first child
+    pipe(pipefd[0]); // pipe from parent to first child
    
     for (size_t i = 0; i < args_size; ++i)
     {
@@ -145,10 +196,15 @@ int bash_execute(char * buff, size_t size, ssize_t end, char *** args, size_t ar
         }
  
         pid = fork();
-        if (!pid) { //child
-            if (size != (size_t) end && i == 0) {
+        if (pid == 0) { //child
+            if (*buffer_size != 0 && i == 0) {
                 close(pipefd[0][1]);
                 dup2(pipefd[0][0], 0);
+                close(pipefd[0][0]);
+            }
+            if (i != 0)
+            {
+                close(pipefd[0][1]);
                 close(pipefd[0][0]);
             }
             if (i != 0)
@@ -163,17 +219,13 @@ int bash_execute(char * buff, size_t size, ssize_t end, char *** args, size_t ar
                 dup2(pipefd[i + 1][1], 1);
                 close(pipefd[i + 1][1]);
             }
+            if (i == 0)
+                first_alive = true;
             _exit(execvp(args[i][0], args[i]));
         }
         else
         {
             childs[i] = pid;
-            if (i == 0 && size != (size_t)end)
-            {
-                close(pipefd[0][0]);
-                write(pipefd[0][1], buff + end, size - end);
-                close(pipefd[0][1]);
-            }
             if (i < args_size - 1)
                 close(pipefd[i + 1][1]);
             if (i >= 1)
@@ -181,16 +233,51 @@ int bash_execute(char * buff, size_t size, ssize_t end, char *** args, size_t ar
         }
     }
  
-    struct sigaction act;
-    memset(&act, '\0', sizeof act);
-    act.sa_handler = &killChildren;
  
-    if (sigaction(SIGINT, &act, 0) < 0)
-        return -1;
-                   
+    if (*buffer_size != 0)
+    {
+        write_all(pipefd[0][1], buffer, *buffer_size);
+        *buffer_size = 0;
+        while (!sig_int && first_alive)
+        {
+            ssize_t rsize = read(0, buffer, *buffer_size);
+            if (rsize == 0)
+                break;
+            if (rsize == -1)
+                continue;
+            write_all(pipefd[0][1], buffer, rsize);
+        }
+    }
+ 
+    if (sig_int)
+        sig_intr();
+ 
+    close(pipefd[0][1]);
+ 
     int status;
+   
     for (size_t i = 0; i < args_size; i++)
-        waitpid(childs[i], &status, 0);
+        while (true)
+        {
+            if (waitpid(childs[i], NULL, 0) == -1) {
+                sig_intr();
+                continue;
+            }
+            break;
+        }
+ 
+ 
+    ssize_t sread;
+    while ((sread = read(pipefd[0][0], buffer + *buffer_size, BUFF_SIZE - *buffer_size)) != 0) {
+        if (sread == -1) {
+            perror("wtf");
+            continue;
+        }
+        *buffer_size += sread;
+    }
+ 
+ 
+    close(pipefd[0][0]);
  
     childs = NULL;
  
@@ -199,24 +286,38 @@ int bash_execute(char * buff, size_t size, ssize_t end, char *** args, size_t ar
  
 int bash_loop()
 {
-    char buff[BUFF_SIZE];
+    struct sigaction act;
+    act.sa_sigaction = &signal_handler;
+    act.sa_flags = SA_SIGINFO;
+   
+    sigemptyset(&act.sa_mask);
+    sigaddset(&act.sa_mask, SIGINT);
+    sigaddset(&act.sa_mask, SIGCHLD);
+    sigaction(SIGINT, &act, 0);
+    sigaction(SIGCHLD, &act, 0);
+ 
+    char buff[BUFF_FULLSIZE];
+    size_t buffer_size;
+   
     char *** args = NULL;
-    size_t args_size;
-    ssize_t end;
+    size_t args_size = 0;
  
     while(1) {
         write(0, "$ ", 2);
        
-        size_t sread = 0;
-        if (!(sread = bash_read(buff)))
+        char * command = NULL;
+        if ((command = bash_read(buff, &buffer_size)) == NULL && buffer_size == 0)
             break;
  
-        if (sread == -1)
+       
+        if (command == NULL)
             continue;
  
-        args = bash_parse(buff, &args_size, &end);
+        args = bash_parse(command, &args_size);
  
-        bash_execute(buff, sread, end, args, args_size);
+        free(command);
+ 
+        bash_execute(buff, &buffer_size, args, args_size);
     }
  
     return 0;
@@ -226,4 +327,3 @@ int main()
 {
     return bash_loop();
 }
-

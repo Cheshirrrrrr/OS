@@ -1,7 +1,7 @@
 all: simplesh
 
 midtemsh: simplesh.cpp
-	g++ simplesh.cpp -std=c++11 -o simplesh
+	clang++ simplesh.cpp -fsanitize=address -std=c++11 -Wall -Wextra -o simplesh
 
 clean:
 	rm -rf simplesh
