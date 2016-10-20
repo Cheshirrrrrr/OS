@@ -146,15 +146,18 @@ char *** bash_parse(char * command, size_t * args_size)
     return args;
 }
  
-volatile pid_t * childs = NULL;
-volatile bool sig_int = false;
-volatile bool first_alive = false;
+pid_t * childs = NULL;
+bool sig_int = false;
+bool first_alive = false;
  
 void signal_handler(int signal, siginfo_t * siginfo, void * ptr) {
-    if (signal == SIGINT) sig_int = true;
     if (signal == SIGCHLD && childs && siginfo->si_pid == childs[0])
     {
         first_alive = false;
+    }
+    if (signal == SIGINT) 
+    {
+        sig_int = true;
     }
 }
  
@@ -172,7 +175,7 @@ void write_all(int fd, const char *buf, size_t len) {
  
 void sig_intr() {
     if (sig_int) {
-        for (volatile pid_t * child = childs; *child != 0; ++child)
+        for (pid_t * child = childs; childs && *child != 0; ++child)
             kill(*child ,SIGKILL);
     }
     sig_int = false;
@@ -270,7 +273,6 @@ int bash_execute(char * buffer, size_t * buffer_size, char *** args, size_t args
     ssize_t sread;
     while ((sread = read(pipefd[0][0], buffer + *buffer_size, BUFF_SIZE - *buffer_size)) != 0) {
         if (sread == -1) {
-            perror("wtf");
             continue;
         }
         *buffer_size += sread;
